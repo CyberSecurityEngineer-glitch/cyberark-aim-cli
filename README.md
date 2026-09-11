@@ -18,3 +18,4 @@ privileged credential rotation logic on a Linux host.
 chmod +x rotate_secret.sh
 ./rotate_secret.sh
 \`\`\`
+# Checking
