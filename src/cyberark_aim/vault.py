@@ -1,13 +1,15 @@
 """
 Encrypted local vault — simulates CyberArk safe storage.
 
-Design notes (write this in your own words for the README later):
-- We use AES-256-GCM via the `cryptography` library.
-- The master key is derived from a passphrase using PBKDF2-HMAC-SHA256
-  with 600,000 iterations (OWASP 2023 recommendation).
-- The vault file stores: salt | nonce | ciphertext.
-- Every read/write appends an entry to an audit log — mimicking
-  CyberArk's audit trail.
+Design notes:
+- AES-256-GCM for authenticated encryption (confidentiality + integrity).
+- Key derivation: PBKDF2-HMAC-SHA256, 600k iterations (OWASP 2023).
+- File layout: [16-byte salt][12-byte nonce][ciphertext+tag]
+- The salt is generated once (on first write) and reused for all
+  subsequent reads/writes. This is critical — if the salt changed,
+  the derived key would change and old ciphertext would be unreadable.
+- Every operation is appended to an audit log — mimicking CyberArk's
+  audit trail behavior.
 """
 from __future__ import annotations
 
@@ -43,20 +45,24 @@ class Vault:
     def __init__(self, vault_path: Path, log_path: Path, passphrase: str):
         self.vault_path = Path(vault_path)
         self.log_path = Path(log_path)
-        self._key = self._derive_key(passphrase)
+        # Store the passphrase so we can re-derive keys on every load.
+        # In production you would keep this in memory only and never
+        # log it, print it, or serialize it.
+        self._passphrase = passphrase
 
-    def _derive_key(self, passphrase: str) -> bytes:
-        salt = os.urandom(SALT_LEN)
+    # ---------- key derivation ----------
+
+    def _derive_key(self, salt: bytes) -> bytes:
+        """Derive an AES key from the passphrase + given salt."""
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=KEY_LEN,
             salt=salt,
             iterations=PBKDF2_ITERATIONS,
         )
-        key = kdf.derive(passphrase.encode())
-        # Store salt alongside vault for decryption
-        self._salt = salt
-        return key
+        return kdf.derive(self._passphrase.encode())
+
+    # ---------- audit log ----------
 
     def _audit(self, action: str, account: str, status: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,28 +75,42 @@ class Vault:
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
+    # ---------- load / save ----------
+
     def _load(self) -> dict[str, Any]:
+        """Decrypt the vault file and return the secrets dict."""
         if not self.vault_path.exists():
             return {}
         raw = self.vault_path.read_bytes()
-        salt, nonce, ct = raw[:SALT_LEN], raw[SALT_LEN:SALT_LEN + NONCE_LEN], raw[SALT_LEN + NONCE_LEN:]
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=KEY_LEN,
-            salt=salt,
-            iterations=PBKDF2_ITERATIONS,
-        )
-        key = kdf.derive(self._passphrase_cache)
+        if len(raw) < SALT_LEN + NONCE_LEN:
+            # File exists but is truncated / corrupt
+            return {}
+        salt = raw[:SALT_LEN]
+        nonce = raw[SALT_LEN:SALT_LEN + NONCE_LEN]
+        ct = raw[SALT_LEN + NONCE_LEN:]
+        key = self._derive_key(salt)
         plaintext = AESGCM(key).decrypt(nonce, ct, None)
         return json.loads(plaintext.decode())
 
     def _save(self, data: dict[str, Any]) -> None:
-        plaintext = json.dumps(data).encode()
-        aes = AESGCM(self._key)
+        """Encrypt the secrets dict and write it to disk."""
+        # If the file already exists, reuse its salt so old and new
+        # ciphertext share the same key. Otherwise, generate a fresh one.
+        if self.vault_path.exists():
+            raw = self.vault_path.read_bytes()
+            salt = raw[:SALT_LEN] if len(raw) >= SALT_LEN else os.urandom(SALT_LEN)
+        else:
+            salt = os.urandom(SALT_LEN)
+
+        key = self._derive_key(salt)
         nonce = os.urandom(NONCE_LEN)
-        ct = aes.encrypt(nonce, plaintext, None)
+        plaintext = json.dumps(data).encode()
+        ct = AESGCM(key).encrypt(nonce, plaintext, None)
+
         self.vault_path.parent.mkdir(parents=True, exist_ok=True)
-        self.vault_path.write_bytes(self._salt + nonce + ct)
+        self.vault_path.write_bytes(salt + nonce + ct)
+
+    # ---------- public API ----------
 
     def get(self, account: str) -> Secret | None:
         data = self._load()
